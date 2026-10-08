@@ -226,16 +226,14 @@ class TestSQLGenerationWithRetry:
 
     @pytest.mark.asyncio
     async def test_generate_sql_fails_after_max_retries(self, mock_schema: DatabaseSchema) -> None:
-        """Test failure after exhausting all retries."""
-        # Setup mocks - all attempts fail validation
+        """Test failure after exhausting all retries (parse errors)."""
+        # Setup mocks - all attempts fail parsing
         mock_generator = AsyncMock()
         mock_generator.last_tokens = None
-        mock_generator.generate.return_value = "DELETE FROM users;"
+        mock_generator.generate.return_value = "SELECT FROM WHERE;"
 
         mock_validator = MagicMock()
-        mock_validator.validate_or_raise.side_effect = SecurityViolationError(
-            "DELETE statements are not allowed"
-        )
+        mock_validator.validate_or_raise.side_effect = SQLParseError("Failed to parse SQL")
 
         orchestrator = QueryOrchestrator(
             sql_generator=mock_generator,
@@ -249,17 +247,57 @@ class TestSQLGenerationWithRetry:
         )
 
         # Execute and verify exception
-        with pytest.raises(SecurityViolationError) as exc_info:
+        with pytest.raises(SQLParseError) as exc_info:
             await orchestrator._generate_sql_with_retry(
-                question="Delete all users",
+                question="Broken query",
                 schema=mock_schema,
                 request_id="test-123",
             )
 
-        assert "DELETE statements are not allowed" in str(exc_info.value)
+        assert "Failed to parse SQL" in str(exc_info.value)
         # Should attempt max_retries + 1 times (initial + retries)
         assert mock_generator.generate.call_count == 3
         assert orchestrator.circuit_breaker.failure_count == 1
+
+    @pytest.mark.asyncio
+    async def test_security_violation_fails_fast(self, mock_schema: DatabaseSchema) -> None:
+        """Security violations must not be retried.
+
+        A policy rejection is deterministic: retrying burns tokens and
+        backoff time (or lets the model rewrite the query into something
+        unrelated, silently swallowing the rejection), and can push the
+        total past the MCP client timeout.
+        """
+        mock_generator = AsyncMock()
+        mock_generator.last_tokens = None
+        mock_generator.generate.return_value = "SELECT email FROM users;"
+
+        mock_validator = MagicMock()
+        mock_validator.validate_or_raise.side_effect = SecurityViolationError(
+            "Access to column 'email' is not allowed"
+        )
+
+        orchestrator = QueryOrchestrator(
+            sql_generator=mock_generator,
+            sql_validator=mock_validator,
+            sql_executors={"test_db": MagicMock()},
+            result_validator=MagicMock(),
+            schema_cache=MagicMock(),
+            pools={"test_db": MagicMock()},
+            resilience_config=ResilienceConfig(max_retries=3, retry_delay=0.1),
+            validation_config=ValidationConfig(),
+        )
+
+        with pytest.raises(SecurityViolationError):
+            await orchestrator._generate_sql_with_retry(
+                question="List all user emails",
+                schema=mock_schema,
+                request_id="test-123",
+            )
+
+        # Exactly one LLM call: no retry, no backoff, no circuit failure
+        mock_generator.generate.assert_called_once()
+        assert orchestrator.circuit_breaker.failure_count == 0
 
     @pytest.mark.asyncio
     async def test_generate_sql_circuit_breaker_open(self, mock_schema: DatabaseSchema) -> None:

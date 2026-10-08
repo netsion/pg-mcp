@@ -467,10 +467,15 @@ class QueryOrchestrator:
         1. Checks circuit breaker state
         2. Generates SQL using LLM (rate-limited, metrics-recorded)
         3. Validates the generated SQL
-        4. On validation failure, sleeps with exponential backoff
+        4. On SQLParseError, sleeps with exponential backoff
            (retry_delay * backoff_factor ** attempt) and retries with
            error feedback
         5. Records success/failure to circuit breaker
+
+        Security violations fail immediately: they are deterministic policy
+        rejections, so retrying would only burn tokens and backoff time (or
+        let the model rewrite the query into something unrelated, silently
+        swallowing the rejection).
 
         Args:
             question: User's natural language question.
@@ -483,8 +488,8 @@ class QueryOrchestrator:
         Raises:
             LLMError: If circuit breaker is open or generation fails.
             RateLimitExceededError: If the LLM concurrency limit is reached.
-            SecurityViolationError: If SQL fails validation after all retries.
-            SQLParseError: If SQL cannot be parsed.
+            SecurityViolationError: Immediately, if SQL violates policy.
+            SQLParseError: If SQL cannot be parsed after all retries.
         """
         # Check circuit breaker
         if not self.circuit_breaker.allow_request():
@@ -547,7 +552,22 @@ class QueryOrchestrator:
                 # Validate SQL
                 try:
                     self.sql_validator.validate_or_raise(generated_sql)
-                except (SecurityViolationError, SQLParseError) as validation_error:
+                except SecurityViolationError as violation_error:
+                    # Deterministic policy rejection: retrying cannot help.
+                    # The LLM call itself succeeded (so the circuit breaker is
+                    # left untouched); a retry would only burn tokens and
+                    # backoff time, or let the model "fix" the SQL into an
+                    # unrelated query that silently swallows the rejection.
+                    logger.warning(
+                        "SQL rejected by security policy; failing fast",
+                        extra={
+                            "request_id": request_id,
+                            "attempt": attempt + 1,
+                            "error": str(violation_error),
+                        },
+                    )
+                    raise
+                except SQLParseError as validation_error:
                     if attempt < max_retries:
                         # Record as failure and retry with feedback after backoff
                         logger.warning(
